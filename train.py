@@ -2,11 +2,23 @@
 Autoresearch pretraining script. Single-GPU, single-file.
 Cherry-picked and simplified from nanochat.
 Usage: uv run train.py
+
+Attention backend selection (see USE_FLEX_ATTENTION below):
+  False — Flash Attention 3 via kernels hub (requires sm_90 / Hopper or compatible)
+  True  — torch.nn.attention.flex_attention compiled via Triton (works on any CUDA
+           architecture including sm_120 / Blackwell). Sliding-window layers use a
+           BlockMask for O(T * window) memory instead of O(T²).
 """
 
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+
+# ---------------------------------------------------------------------------
+# Attention backend: set True for Blackwell (sm_120) or any non-Hopper GPU,
+#                    set False to use Flash Attention 3 (Hopper / sm_90).
+# ---------------------------------------------------------------------------
+USE_FLEX_ATTENTION = True
 
 import gc
 import math
@@ -17,11 +29,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+if USE_FLEX_ATTENTION:
+    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+else:
+    from kernels import get_kernel
+    cap = torch.cuda.get_device_capability()
+    # varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
+    repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+    fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -58,6 +73,24 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3)
 
 
+def make_block_mask(window, seq_len, device):
+    """
+    Create a BlockMask for flex_attention.
+    window = seq_len  → full causal mask.
+    window < seq_len  → sliding-window causal mask.
+    BlockMask stores only the sparse block structure: O(T * window) memory.
+    """
+    if window >= seq_len:
+        def mask_fn(b, h, q_idx, kv_idx):
+            return q_idx >= kv_idx
+    else:
+        def mask_fn(b, h, q_idx, kv_idx, w=window):
+            return (q_idx >= kv_idx) & (q_idx - kv_idx < w)
+    return create_block_mask(mask_fn, B=None, H=None,
+                             Q_LEN=seq_len, KV_LEN=seq_len,
+                             device=device, _compile=True)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -74,7 +107,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def forward(self, x, ve, cos_sin, attn_arg):
         B, T, C = x.size()
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
@@ -90,8 +123,19 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        y = y.contiguous().view(B, T, -1)
+        if USE_FLEX_ATTENTION:
+            # attn_arg is a BlockMask; flex_attention expects (B, H, T, D)
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            y = flex_attention(q, k, v, block_mask=attn_arg,
+                               enable_gqa=(self.n_kv_head != self.n_head))
+            y = y.transpose(1, 2).contiguous().view(B, T, -1)
+        else:
+            # attn_arg is a (window_size, 0) tuple for FA3
+            y = fa3.flash_attn_func(q, k, v, causal=True, window_size=attn_arg)
+            y = y.contiguous().view(B, T, -1)
+
         y = self.c_proj(y)
         return y
 
@@ -115,8 +159,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
+    def forward(self, x, ve, cos_sin, attn_arg):
+        x = x + self.attn(norm(x), ve, cos_sin, attn_arg)
         x = x + self.mlp(norm(x))
         return x
 
@@ -145,6 +189,9 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
+        # BlockMasks for flex_attention (populated in init_weights when device is known)
+        if USE_FLEX_ATTENTION:
+            self.block_masks = [None] * config.n_layer
 
     @torch.no_grad()
     def init_weights(self):
@@ -179,6 +226,12 @@ class GPT(nn.Module):
         self.transformer.wte.to(dtype=torch.bfloat16)
         for ve in self.value_embeds.values():
             ve.to(dtype=torch.bfloat16)
+        # Build BlockMasks now that device is known (flex_attention only)
+        if USE_FLEX_ATTENTION:
+            device = self.transformer.wte.weight.device
+            T = self.config.sequence_len
+            for i, (window, _) in enumerate(self.window_sizes):
+                self.block_masks[i] = make_block_mask(window, T, device)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
@@ -276,7 +329,8 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
+            attn_arg = self.block_masks[i] if USE_FLEX_ATTENTION else self.window_sizes[i]
+            x = block(x, ve, cos_sin, attn_arg)
         x = norm(x)
 
         softcap = 15
@@ -448,7 +502,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+DEVICE_BATCH_SIZE = 64  # per-device batch size (reduce to 64 if OOM on Blackwell with flex_attention)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
