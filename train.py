@@ -124,12 +124,12 @@ class CausalSelfAttention(nn.Module):
         q, k = norm(q), norm(k)
 
         if USE_FLEX_ATTENTION:
-            # attn_arg is a BlockMask; flex_attention expects (B, H, T, D)
+            # Use PyTorch SDPA (is_causal=True) — faster on Blackwell than Triton flex_attention
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
-            y = flex_attention(q, k, v, block_mask=attn_arg,
-                               enable_gqa=(self.n_kv_head != self.n_head))
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True,
+                                               enable_gqa=(self.n_kv_head != self.n_head))
             y = y.transpose(1, 2).contiguous().view(B, T, -1)
         else:
             # attn_arg is a (window_size, 0) tuple for FA3
@@ -486,7 +486,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # Model architecture
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
+WINDOW_PATTERN = "L"    # all full causal (SDPA path, no sliding window needed)
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**17 # ~131K tokens per optimizer step
