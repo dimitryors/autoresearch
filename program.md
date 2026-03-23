@@ -50,17 +50,34 @@ With a fixed 5-minute time budget, **the number of optimizer steps is the single
 **Priority order** (do these in sequence, each builds on the previous):
 
 1. **Throughput optimization** (free wins, no quality tradeoff):
-   - `torch.compile` mode: try `max-autotune` first, then `reduce-overhead`. These find better CUDA kernels and use CUDA graphs. On some hardware `max-autotune` gives 5-10% more MFU for free.
-   - SDPA backend selection: try forcing CuDNN (`torch.backends.cuda.enable_cudnn_sdp(True)` + disable others) — it can be faster than the default on newer GPUs. Also try `torch.backends.cudnn.benchmark = True`.
+   - `torch.compile` mode: try `max-autotune` first, then `reduce-overhead`. `max-autotune` was validated as ~7% faster (1510 vs 1414 steps). Stick with it.
+   - SDPA backend selection: let PyTorch auto-select all backends — forcing CuDNN was worse. Don't override SDPA backend choices.
    - These are zero-risk changes: same model, same math, just faster execution.
 
-2. **Batch size / step count tuning**:
-   - Reduce `TOTAL_BATCH_SIZE` to get more optimizer steps (fewer tokens per step but more steps total). The optimal point depends on model size — too small loses gradient quality, too large loses steps.
-   - Keep `DEVICE_BATCH_SIZE` as large as VRAM allows (avoid gradient accumulation — it effectively halves your step count since each accumulation micro-step takes nearly as long as a full step).
+2. **Model depth/width scaling** (biggest single improvement category):
+   - DEPTH=9 at 512 dim (ASPECT_RATIO=56) was the single biggest improvement (1.036→1.033). More layers beat wider layers at fixed VRAM.
+   - On RTX 5090 (32 GB), DEPTH=9 at 512 dim with BS=64 uses ~24.7 GB. DEPTH=10 at 512 dim uses ~27 GB but loses too many steps (1158 vs 1350). 640 dim OOMs at BS=64.
+   - The sweet spot is the deepest model that still gets ≥1300 steps at BS=64 without gradient accumulation.
 
-3. **LR schedule tuning**: `WARMDOWN_RATIO` is the most impactful schedule parameter. Tune it in ~0.05 increments.
+3. **Schedule shape tuning** (second biggest improvement category):
+   - **Weight decay schedule**: Quadratic decay `(1-p)^2` beat linear `(1-p)`. This was the second-best improvement (1.033068→1.032967). The key insight: quadratic WD decays faster, so WD/LR ratio stays low at end of training — model is free for fine-tuning in the warmdown phase.
+   - Cubic `(1-p)^3` was too aggressive. Exponent 1.5 was insufficient. Cosine WD was worse. Quadratic (exponent 2.0) is optimal.
+   - **LR warmdown**: Linear warmdown is optimal. Cosine warmdown was much worse (1.038 vs 1.033). Don't change the warmdown shape.
+   - `WARMDOWN_RATIO` has a sweet spot at 0.65. Tested 0.6, 0.65, 0.7, 0.75 — 0.65 wins consistently across model sizes.
 
-4. **Architecture / hyperparameter tuning**: Only after throughput is maximized. Most hyperparameters have narrow sweet spots — expect diminishing returns quickly.
+4. **Hyperparameter fine-tuning** (diminishing returns — most params are at tight optima):
+   - LR values (MATRIX_LR=0.04, EMBEDDING_LR=0.5, SCALAR_LR=0.25, UNEMBEDDING_LR=0.004) are tightly optimized. ±0.005-0.01 changes all hurt.
+   - WEIGHT_DECAY=0.15 is optimal. Tested 0.1, 0.12, 0.15, 0.18, 0.2, 0.25, 0.3.
+   - ADAM_BETAS=(0.8, 0.95) is optimal. Higher/lower beta1 and higher beta2 all worse.
+   - Muon: ns_steps=5, momentum ramp 0.85→0.95 over 300 steps. All variations tested, all worse.
+   - softcap=12 is optimal. Tested 10, 11, 12, 13, 14, and no cap. Removing cap is very bad (1.047).
+
+5. **Unexplored territory for next 100 experiments**:
+   - **Data-side optimizations**: sequence packing, curriculum learning, data mixing strategies (within prepare.py constraints).
+   - **New attention patterns**: sliding window + global hybrid, local attention for some layers.
+   - **Initialization schemes**: different init scales, layer-dependent scaling.
+   - **New optimizer ideas**: LR warmup reintroduction with different schedule, cyclical LR, per-layer LR schedules beyond current groups.
+   - **Architectural novelties**: mixture of depths (early exit), different normalization, attention modifications (e.g. differential attention, multi-head latent attention).
 
 **Anti-patterns** (things that consistently fail — avoid wasting experiments on these):
 
@@ -70,8 +87,26 @@ With a fixed 5-minute time budget, **the number of optimizer steps is the single
 - **Label smoothing**: trains on soft targets but eval uses hard targets — the mismatch causes large quality drops.
 - **Auxiliary losses** (multi-token prediction, z-loss): the extra compute per step reduces step count, and the added gradient signal doesn't compensate in short training runs.
 - **Reduced precision flags** (e.g. `allow_bf16_reduced_precision_reduction`): loses quality without meaningful speed gains on modern GPUs.
+- **Parallel attention+MLP** (PaLM-style): tested, hurts quality despite gaining ~31 steps. The interaction between attn and MLP outputs matters.
+- **GQA with halved KV heads** (n_kv_head=2 from 4): quality drop (1.044) far exceeds the memory savings at this model size. KV cache is not the bottleneck.
+- **Shared value embeddings**: per-layer VE is important. Sharing a single VE across layers loses quality (1.038).
+- **Removing QK norm**: catastrophic — causes 0.018 bpb loss. QK norm is critical for training stability.
+- **Cosine LR warmdown**: much worse than linear (1.038 vs 1.033). Linear warmdown is the right shape.
+- **Gradient clipping with Muon**: unnecessary, Muon's Newton step already controls update magnitudes.
+- **Constant weight decay** (no decay to 0): WD decay schedule is important for end-of-training refinement.
+- **Combining near-misses**: changes that individually score close to the best rarely combine for improvement. They are not orthogonal — they often compete for the same "slack" in the loss landscape.
+- **SiLU activation**: much worse than ReLU² (1.048 vs 1.033) and uses more memory.
+- **SwiGLU MLP**: worse quality (1.042) and more memory than ReLU² with standard MLP.
+- **RoPE base frequency changes**: base=50000 was worse than default 10000.
 
 **Diminishing returns**: If 10+ consecutive experiments are discarded and all within ±0.002 of the best, the hyperparameter space is likely exhausted at the current architecture. At that point, don't keep grid-searching — either try a fundamentally different approach (new architecture, new optimizer, new training technique) or accept the current result.
+
+**Key learnings from first 100 experiments (mar22 run)**:
+- 8 keeps out of 100 experiments (8% success rate). Most improvements came in the first 50 experiments.
+- Total improvement: 1.036433 → 1.032967 (Δ=-0.003466, ~0.33% relative improvement).
+- Biggest wins by category: depth scaling (Δ=-0.003), schedule shape (Δ=-0.001), individual hyperparams (Δ=-0.001 cumulative from 5 small wins).
+- After ~experiment 88 (quadratic WD), 12 consecutive experiments were discarded — the current config is at a local optimum for conventional hyperparameter tuning.
+- The next 100 experiments should focus on architectural novelties and training technique changes, not hyperparameter grid search.
 
 ## Output format
 
