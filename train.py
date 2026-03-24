@@ -120,8 +120,8 @@ class CausalSelfAttention(nn.Module):
             v = v + gate.unsqueeze(-1) * ve
 
         cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
 
         if USE_FLEX_ATTENTION:
             # Use PyTorch SDPA (is_causal=True) — faster on Blackwell than Triton flex_attention
