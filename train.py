@@ -120,8 +120,8 @@ class CausalSelfAttention(nn.Module):
             v = v + gate.unsqueeze(-1) * ve
 
         cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
 
         if USE_FLEX_ATTENTION:
             # Use PyTorch SDPA (is_causal=True) — faster on Blackwell than Triton flex_attention
@@ -154,15 +154,21 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, drop_prob=0.0):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        self.drop_prob = drop_prob
 
     def forward(self, x, ve, cos_sin, attn_arg):
-        x = x + self.attn(norm(x), ve, cos_sin, attn_arg)
-        x = x + self.mlp(norm(x))
-        return x
+        mid = x + self.attn(norm(x), ve, cos_sin, attn_arg)
+        out = mid + self.mlp(norm(mid))
+        if self.training and self.drop_prob > 0.0:
+            survival = 1.0 - self.drop_prob
+            rand = torch.rand(x.shape[0], 1, 1, device=x.device, dtype=x.dtype)
+            mask = (rand <= survival).to(x.dtype) / survival
+            return x + mask * (out - x)
+        return out
 
 
 class GPT(nn.Module):
@@ -170,9 +176,11 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
         self.window_sizes = self._compute_window_sizes(config)
+        n = config.n_layer
+        _drop_probs = [STOCHASTIC_DEPTH_MAX * i / max(n - 1, 1) for i in range(n)]
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
+            "h": nn.ModuleList([Block(config, i, drop_prob=_drop_probs[i]) for i in range(n)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
@@ -333,7 +341,7 @@ class GPT(nn.Module):
             x = block(x, ve, cos_sin, attn_arg)
         x = norm(x)
 
-        softcap = 12
+        softcap = 13.25
         logits = self.lm_head(x)
         logits = logits.float()
         logits = softcap * torch.tanh(logits / softcap)
@@ -463,7 +471,7 @@ class MuonAdamW(torch.optim.Optimizer):
         stacked_params = torch.stack(params)
         self._muon_momentum_t.fill_(group["momentum"])
         self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
-        self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
+        self._muon_lr_t.fill_(group["lr"])
         self._muon_wd_t.fill_(group["weight_decay"])
         muon_step_fused(stacked_grads, stacked_params,
                         state["momentum_buffer"], state["second_momentum_buffer"],
@@ -487,18 +495,19 @@ class MuonAdamW(torch.optim.Optimizer):
 ASPECT_RATIO = 56       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "L"    # all full causal (SDPA path, no sliding window needed)
+STOCHASTIC_DEPTH_MAX = 0.1  # max drop prob at last layer (linear from 0 to this)
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**17 # ~131K tokens per optimizer step
 EMBEDDING_LR = 0.5      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
-MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
+MATRIX_LR = 0.055       # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.25        # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.15     # cautious weight decay for Muon
+WEIGHT_DECAY = 0.18     # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.65   # fraction of time budget for LR warmdown
-FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
+FINAL_LR_FRAC = 0.02    # final LR as fraction of initial (small non-zero end)
 
 # Model size
 DEPTH = 9               # number of transformer layers
@@ -589,7 +598,7 @@ def get_muon_momentum(step):
     return (1 - frac) * 0.85 + frac * 0.95
 
 def get_weight_decay(progress):
-    return WEIGHT_DECAY * (1 - progress) ** 2
+    return WEIGHT_DECAY * (1 - progress) ** 1.5
 
 # ---------------------------------------------------------------------------
 # Training loop
