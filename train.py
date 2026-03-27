@@ -154,15 +154,21 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, drop_prob=0.0):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        self.drop_prob = drop_prob
 
     def forward(self, x, ve, cos_sin, attn_arg):
-        x = x + self.attn(norm(x), ve, cos_sin, attn_arg)
-        x = x + self.mlp(norm(x))
-        return x
+        mid = x + self.attn(norm(x), ve, cos_sin, attn_arg)
+        out = mid + self.mlp(norm(mid))
+        if self.training and self.drop_prob > 0.0:
+            survival = 1.0 - self.drop_prob
+            rand = torch.rand(x.shape[0], 1, 1, device=x.device, dtype=x.dtype)
+            mask = (rand <= survival).to(x.dtype) / survival
+            return x + mask * (out - x)
+        return out
 
 
 class GPT(nn.Module):
@@ -170,9 +176,11 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
         self.window_sizes = self._compute_window_sizes(config)
+        n = config.n_layer
+        _drop_probs = [STOCHASTIC_DEPTH_MAX * i / max(n - 1, 1) for i in range(n)]
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
+            "h": nn.ModuleList([Block(config, i, drop_prob=_drop_probs[i]) for i in range(n)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
@@ -487,6 +495,7 @@ class MuonAdamW(torch.optim.Optimizer):
 ASPECT_RATIO = 56       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "L"    # all full causal (SDPA path, no sliding window needed)
+STOCHASTIC_DEPTH_MAX = 0.1  # max drop prob at last layer (linear from 0 to this)
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**17 # ~131K tokens per optimizer step
